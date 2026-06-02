@@ -17,10 +17,12 @@ API 文档:
     GET  /api/stats                系统统计信息
 """
 
+import os
 import pandas as pd
 from fastapi import FastAPI, Depends, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from contextlib import asynccontextmanager
@@ -122,6 +124,19 @@ app.add_middleware(
     allow_headers=["*"],           # 允许所有请求头
     expose_headers=["*"],
 )
+
+# ---- 挂载前端静态文件 ----
+frontend_dist = os.path.join(PROJECT_ROOT, "frontend", "dist")
+if os.path.isdir(frontend_dist):
+    app.mount("/static", StaticFiles(directory=frontend_dist), name="static")
+
+    @app.get("/app", tags=["系统"])
+    def serve_frontend():
+        """前端应用入口（生产模式）"""
+        index_path = os.path.join(frontend_dist, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        return {"message": "前端已构建，但未找到 index.html"}
 
 
 # ============================================================
