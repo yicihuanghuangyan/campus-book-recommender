@@ -235,8 +235,9 @@ def generate_ratings(users, books):
         dept = user["department"]
         preferred_categories = DEPARTMENT_CATEGORY_PREFERENCE.get(dept, [])
 
-        # 每位用户评分的书籍数量
-        num_rated = random.randint(15, 50)
+        # 每位用户评分的书籍数量（最多评 NUM_BOOKS-2 本，确保有未读的可推荐）
+        max_ratings_per_user = min(28, NUM_BOOKS - 3)
+        num_rated = random.randint(10, max_ratings_per_user)
 
         # 为用户选择要评分的书籍
         candidate_books = list(range(1, NUM_BOOKS + 1))
@@ -279,9 +280,10 @@ def generate_ratings(users, books):
             })
             rating_id += 1
 
-        # 确保最低评分数量
+        # 确保最低评分数量（至少10条，且不超过总数-2）
+        min_ratings = min(10, NUM_BOOKS - 2)
         actual_count = num_preferred + num_non_preferred
-        while actual_count < 15 and len(candidate_books) > actual_count:
+        while actual_count < min_ratings and len(candidate_books) > actual_count:
             extra_book = candidate_books[actual_count]
             if extra_book not in selected:
                 selected.append(extra_book)
