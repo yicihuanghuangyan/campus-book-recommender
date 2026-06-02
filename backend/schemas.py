@@ -117,7 +117,19 @@ class RecommendResponse(BaseModel):
     user_id: int
     recommendations: list[RecommendItem]
     method: str
+    source: str = "cf"  # 推荐来源: "cf"=协同过滤, "popular"=冷启动热门兜底
     total: int
+
+
+class PopularBookItem(BaseModel):
+    """热门书籍条目"""
+    book_id: int
+    title: str
+    author: Optional[str] = None
+    category: Optional[str] = None
+    avg_score: float         # 平均评分
+    rating_count: int        # 评分人数
+    popularity: float        # 综合热度分
 
 
 # ============================================================

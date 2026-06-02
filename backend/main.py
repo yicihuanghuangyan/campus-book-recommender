@@ -35,6 +35,7 @@ from .models import User, Book, Rating
 from .schemas import (
     UserResponse, BookResponse, RatingCreate, RatingResponse,
     RecommendResponse, RecommendItem, StatsResponse, MessageResponse,
+    PopularBookItem,
 )
 
 # ---- 全局推荐器实例（应用启动时初始化）----
@@ -218,6 +219,71 @@ def list_categories(db: Session = Depends(get_db)):
     return [c[0] for c in categories if c[0]]
 
 
+# ---- 热门书籍（冷启动兜底 / 首页推荐）----
+
+@app.get("/api/books/popular", response_model=list[PopularBookItem], tags=["书籍"])
+def get_popular_books(
+    top_n: int = Query(default=10, ge=1, le=50, description="返回数量"),
+    db: Session = Depends(get_db),
+):
+    """
+    **冷启动兜底 / 首页热门推荐**
+
+    按综合热度排序。热度 = 评分人数归一化 × 0.7 + 平均分归一化 × 0.3
+
+    用于:
+      - 首页「热门好书」榜单
+      - 新用户（无评分历史）的推荐兜底
+      - 协同过滤结果不足时的补充
+    """
+    from sqlalchemy import func as sqlfunc
+    popular = (
+        db.query(
+            Book,
+            sqlfunc.count(Rating.rating_id).label("rating_count"),
+            sqlfunc.avg(Rating.score).label("avg_score"),
+        )
+        .outerjoin(Rating, Book.book_id == Rating.book_id)
+        .group_by(Book.book_id)
+        .all()
+    )
+
+    if not popular:
+        return []
+
+    # 归一化：消除量纲差异
+    max_count = max(p.rating_count for p in popular)
+    min_count = min(p.rating_count for p in popular)
+    max_avg = max((p.avg_score or 0) for p in popular)
+    min_avg = min((p.avg_score or 0) for p in popular)
+
+    count_range = max_count - min_count if max_count != min_count else 1
+    avg_range = max_avg - min_avg if max_avg != min_avg else 1
+
+    result = []
+    for p in popular:
+        book = p[0]
+        count = p.rating_count
+        avg = p.avg_score or 0.0
+
+        count_norm = (count - min_count) / count_range
+        avg_norm = (avg - min_avg) / avg_range
+        popularity = count_norm * 0.7 + avg_norm * 0.3
+
+        result.append(PopularBookItem(
+            book_id=book.book_id,
+            title=book.title,
+            author=book.author,
+            category=book.category,
+            avg_score=round(float(avg), 2),
+            rating_count=count,
+            popularity=round(float(popularity), 4),
+        ))
+
+    result.sort(key=lambda x: x.popularity, reverse=True)
+    return result[:top_n]
+
+
 @app.get("/api/books/{book_id}", response_model=BookResponse, tags=["书籍"])
 def get_book(book_id: int, db: Session = Depends(get_db)):
     """
@@ -385,22 +451,84 @@ def recommend_for_user(
 
     # 检查用户是否存在
     user = db.query(User).filter(User.user_id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail=f"用户 {user_id} 不存在")
+    user_exists = user is not None
 
     # 调用推荐算法
-    try:
-        recs = recommender.recommend(user_id, top_n=top_n, method=method, k=k)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"推荐计算失败: {str(e)}")
+    recs = []
+    source = "cf"  # 默认协同过滤
 
-    # 如果推荐结果为空，尝试降低 top_n 或切换方法
-    if not recs and recommender is not None:
-        # 回退：尝试用 item_based
+    if not user_exists:
+        # 用户不存在（新用户/测试用户）→ 直接冷启动热门兜底
+        source = "popular"
+        user_rating_count = 0
+    else:
+        # 检查用户评分数量
+        user_rating_count = db.query(Rating).filter(Rating.user_id == user_id).count()
+
+    if user_rating_count == 0:
+        # 场景1: 全新用户，无任何评分 → 直接热门兜底
+        source = "popular"
+    else:
+        # 场景2: 有评分记录 → 尝试协同过滤
         try:
-            recs = recommender.recommend(user_id, top_n=top_n, method="item_based")
-        except Exception:
-            pass
+            recs = recommender.recommend(user_id, top_n=top_n, method=method, k=k)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"推荐计算失败: {str(e)}")
+
+        # 如果 CF 推荐结果不足，尝试其他方法
+        if len(recs) < top_n and recommender is not None:
+            fallback_methods = ["item_based"] if method == "user_based" else ["user_based"]
+            for fb_method in fallback_methods:
+                try:
+                    extra = recommender.recommend(user_id, top_n=top_n, method=fb_method, k=k)
+                    existing_ids = {r["book_id"] for r in recs}
+                    for r in extra:
+                        if r["book_id"] not in existing_ids:
+                            recs.append(r)
+                        if len(recs) >= top_n:
+                            break
+                except Exception:
+                    pass
+
+        # 场景3: CF 结果仍为空 → 冷启动，热门兜底
+        if not recs:
+            source = "popular"
+
+    # ---- 冷启动兜底：用热门书籍填充 ----
+    if source == "popular" or len(recs) < top_n:
+        from sqlalchemy import func as sqlfunc
+
+        hot_books = (
+            db.query(
+                Book,
+                sqlfunc.count(Rating.rating_id).label("cnt"),
+                sqlfunc.avg(Rating.score).label("avg"),
+            )
+            .outerjoin(Rating, Book.book_id == Rating.book_id)
+            .group_by(Book.book_id)
+            .order_by(sqlfunc.count(Rating.rating_id).desc(), sqlfunc.avg(Rating.score).desc())
+            .limit(top_n * 2)
+            .all()
+        )
+
+        existing_ids = {r["book_id"] for r in recs}
+        user_rated = {
+            r.book_id for r in db.query(Rating.book_id)
+            .filter(Rating.user_id == user_id).all()
+        }
+
+        for hb in hot_books:
+            book = hb[0]
+            if book.book_id in existing_ids or book.book_id in user_rated:
+                continue
+            recs.append({
+                "book_id": int(book.book_id),
+                "predicted_score": round(float(hb.avg or 4.0), 2),
+                "method": "popular",
+                "reason": "热门推荐（为你发现校园最受欢迎的好书）",
+            })
+            if len(recs) >= top_n:
+                break
 
     # 附加书籍详细信息
     book_ids = [r["book_id"] for r in recs]
@@ -426,6 +554,7 @@ def recommend_for_user(
         user_id=user_id,
         recommendations=recommendations,
         method=method,
+        source=source,
         total=len(recommendations),
     )
 
